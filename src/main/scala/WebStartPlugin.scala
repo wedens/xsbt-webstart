@@ -10,43 +10,45 @@ import ClasspathPlugin._
 object WebStartPlugin extends Plugin {
 	//------------------------------------------------------------------------------
 	//## configuration objects
-	
+
 	case class GenConfig(
 		dname:String,
 		validity:Int
 	)
-	
+
 	case class KeyConfig(
 		keyStore:File,
 		storePass:String,
 		alias:String,
-		keyPass:String
+		keyPass:String,
+    tsaUrl:Option[String] = None
 	)
-	
+
 	case class JnlpConfig(
-		fileName:String, 
+		fileName:String,
 		descriptor:(String,Seq[JnlpAsset])=>Elem
 	)
-	
+
 	case class JnlpAsset(href:String, main:Boolean, size:Long) {
-		def toElem:Elem	= <jar href={href} main={main.toString} size={size.toString}/> 
+		def toElem:Elem	= <jar href={href} main={main.toString} size={size.toString}/>
 	}
-	
+
 	//------------------------------------------------------------------------------
 	//## exported
-	
+
 	val webstartKeygen			= taskKey[Unit]("generate a signing key")
 	val webstart				= taskKey[File]("complete build, returns the output directory")
+  val webstartUseTsa = taskKey[Boolean]("use timestamp authority for signing")
 	val webstartOutput			= settingKey[File]("where to put the output files")
 	val webstartGenConfig		= settingKey[Option[GenConfig]]("configurations for signing key generation")
 	val webstartKeyConfig		= settingKey[Option[KeyConfig]]("configuration for signing keys")
 	val webstartJnlpConfigs		= settingKey[Seq[JnlpConfig]]("configurations for jnlp files to create")
 	val webstartManifest		= settingKey[Option[File]]("manifest file to be included in jar files")
 	val webstartExtras			= taskKey[Traversable[(File,String)]]("extra files to include in the build")
-	
+
 	// webstartJnlp		<<= (Keys.name) { it => it + ".jnlp" },
 	lazy val webstartSettings:Seq[Def.Setting[_]]	=
-			classpathSettings ++ 
+			classpathSettings ++
 			Vector(
 				webstartKeygen	:=
 						keygenTaskImpl(
@@ -59,6 +61,7 @@ object WebStartPlugin extends Plugin {
 							streams		= Keys.streams.value,
 							assets		= classpathAssets.value,
 							keyConfig	= webstartKeyConfig.value,
+              useTsa    = webstartUseTsa.value,
 							jnlpConfigs	= webstartJnlpConfigs.value,
 							manifest	= webstartManifest.value,
 							extras		= webstartExtras.value,
@@ -70,16 +73,18 @@ object WebStartPlugin extends Plugin {
 				webstartJnlpConfigs	:= Seq.empty,
 				webstartManifest	:= None,
 				webstartExtras		:= Seq.empty,
+        webstartUseTsa    := webstartKeyConfig.value.exists(_.tsaUrl.isDefined),
 				Keys.watchSources	:= Keys.watchSources.value ++ webstartManifest.value.toVector
 			)
-	
+
 	//------------------------------------------------------------------------------
 	//## tasks
-	
+
 	private def buildTaskImpl(
-		streams:TaskStreams,	
+		streams:TaskStreams,
 		assets:Seq[ClasspathAsset],
 		keyConfig:Option[KeyConfig],
+    useTsa:Boolean,
 		jnlpConfigs:Seq[JnlpConfig],
 		manifest:Option[File],
 		extras:Traversable[(File,String)],
@@ -93,12 +98,12 @@ object WebStartPlugin extends Plugin {
 					target	= output / asset.name
 				}
 				yield (source, target)
-				
+
 		streams.log info "copying assets"
 		// BETTER care about freshness
 		val assetsToCopy	= assetMap filter { case (source,target) => source newerThan target }
 		val assetsCopied	= IO copy assetsToCopy
-		
+
 		// BETTER care about freshness
 		val freshJars	= assetsCopied
 		if (freshJars.nonEmpty) {
@@ -111,21 +116,25 @@ object WebStartPlugin extends Plugin {
 					extendManifest(manifest, jar, streams.log)
 				}
 			}
-			
+
 			if (keyConfig.isEmpty) {
 				streams.log info "missing KeyConfig, leaving jar files unsigned"
 			}
 			keyConfig foreach { keyConfig =>
-				streams.log info "signing jars"
+        keyConfig.tsaUrl match {
+          case Some(_)        => streams.log info "signing jars with tsa usage"
+          case None if useTsa => sys error "tsa usage enabled but tsa url is not provided"
+          case _              => streams.log info "signing jars without using tsa"
+        }
 				freshJars.par foreach { jar =>
-					signAndVerify(keyConfig, jar, streams.log)
+					signAndVerify(keyConfig, useTsa, jar, streams.log)
 				}
 			}
 		}
 		else {
 			streams.log info "no fresh jars to sign"
 		}
-		
+
 		// @see http://download.oracle.com/javase/tutorial/deployment/deploymentInDepth/jnlpFileSyntax.html
 		streams.log info "creating jnlp descriptor(s)"
 		// main jar must come first
@@ -140,20 +149,20 @@ object WebStartPlugin extends Plugin {
 			IO write (jnlpFile, str)
 		}
 		val jnlpFiles	= configFiles map { _._2 }
-		
+
 		streams.log info "copying extras"
 		val extrasToCopy	= extras map { case (file,path) => (file, output / path) }
 		val extrasCopied	= IO copy extrasToCopy
-		
+
 		streams.log info "cleaning up"
 		val allFiles	= (output * "*").get.toSet
 		val jarFiles	= assetMap map { case (source,target) => target }
-		val obsolete	= allFiles -- jarFiles -- extrasCopied -- jnlpFiles 
+		val obsolete	= allFiles -- jarFiles -- extrasCopied -- jnlpFiles
 		IO delete obsolete
-		
+
 		output
 	}
-	
+
 	private def extendManifest(manifest:File, jar:File, log:Logger) {
 		val rc	=
 				Process("jar", List(
@@ -163,11 +172,16 @@ object WebStartPlugin extends Plugin {
 				)) ! log
 		if (rc != 0)	sys error s"manifest change failed: ${rc}"
 	}
-	
-	private def signAndVerify(keyConfig:KeyConfig, jar:File, log:Logger) {
+
+	private def signAndVerify(keyConfig:KeyConfig, useTsa:Boolean, jar:File, log:Logger) {
 		// sigfile, storetype, provider, providerName
+    val tsaUrl = keyConfig.tsaUrl
+      .filter(_ => useTsa)
+      .map(url => List("-tsa", url))
+      .getOrElse(List.empty)
+
 		val rc1	=
-				Process("jarsigner", List(
+        Process("jarsigner", tsaUrl ++ List(
 					// "-verbose",
 					"-keystore",	keyConfig.keyStore.getAbsolutePath,
 					"-storepass",	keyConfig.storePass,
@@ -178,8 +192,8 @@ object WebStartPlugin extends Plugin {
 					keyConfig.alias
 				)) ! log
 		if (rc1 != 0)	sys error s"sign failed: ${rc1}"
-	
-		val rc2	= 
+
+		val rc2	=
 				Process("jarsigner", List(
 					"-verify",
 					"-keystore",	keyConfig.keyStore.getAbsolutePath,
@@ -189,9 +203,9 @@ object WebStartPlugin extends Plugin {
 				)) ! log
 		if (rc2 != 0)	sys error s"verify failed: ${rc2}"
 	}
-	
+
 	//------------------------------------------------------------------------------
-	
+
 	private def keygenTaskImpl(
 		streams:TaskStreams,
 		genConfig:Option[GenConfig],
@@ -207,15 +221,15 @@ object WebStartPlugin extends Plugin {
 			genkey(keyConfig, genConfig, streams.log)
 		}
 	}
-	
+
 	private def genkey(keyConfig:KeyConfig, genConfig:GenConfig, log:Logger) {
-		val rc	= 
+		val rc	=
 				Process("keytool", List(
-					"-genkey", 
-					"-dname",		genConfig.dname, 
-					"-validity",	genConfig.validity.toString, 
+					"-genkey",
+					"-dname",		genConfig.dname,
+					"-validity",	genConfig.validity.toString,
 					"-keystore",	keyConfig.keyStore.getAbsolutePath,
-					"-storePass",	keyConfig.storePass, 
+					"-storePass",	keyConfig.storePass,
 					"-keypass",		keyConfig.keyPass,
 					"-alias",		keyConfig.alias
 				)) ! log
