@@ -122,9 +122,9 @@ object WebStartPlugin extends Plugin {
 			}
 			keyConfig foreach { keyConfig =>
         keyConfig.tsaUrl match {
-          case Some(_)        => streams.log info "signing jars with tsa usage"
-          case None if useTsa => sys error "tsa usage enabled but tsa url is not provided"
-          case _              => streams.log info "signing jars without using tsa"
+          case Some(_) if useTsa => streams.log info "signing jars with tsa usage"
+          case None if useTsa    => sys error "tsa usage enabled but tsa url is not provided"
+          case _                 => streams.log info "signing jars without using tsa"
         }
 				freshJars.par foreach { jar =>
 					signAndVerify(keyConfig, useTsa, jar, streams.log)
