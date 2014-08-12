@@ -1,3 +1,5 @@
+package de.djini.xsbt.webstart
+
 import sbt._
 
 import scala.xml.Elem
@@ -5,7 +7,7 @@ import scala.xml.Elem
 import Keys.{ Classpath, TaskStreams }
 import Project.Initialize
 
-import ClasspathPlugin._
+import de.djini.xsbt.classpath.ClasspathPlugin._
 
 object WebStartPlugin extends Plugin {
 	//------------------------------------------------------------------------------
